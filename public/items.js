@@ -359,7 +359,7 @@ export function analyzeItems(a, consts, heroData = {}) {
 
       threats.push({
         id: rule.id, title: rule.title, why: rule.why, status, weight, sources, text, chips,
-        answers: fits,
+        answers: best ? [best, ...fits.filter((x) => x.key !== best.key)] : fits,
         covered: status === 'covered' || status === 'hero' || status === 'mate',
         counted: ['covered', 'hero', 'mate', 'open'].includes(status),
         killsOnMe, dmg, dmgShare: heroDmgTotal ? dmg / heroDmgTotal : null,
@@ -457,8 +457,8 @@ export function analyzeItems(a, consts, heroData = {}) {
     const open = threats.filter((x) => x.status === 'open');
     let swap = null;
     const strongOpen = open;
-    if (strongOpen.length && effMin > 25) {
-      const target = strongOpen[0];
+    const target = strongOpen.find((x) => x.answers[0]);
+    if (target && effMin > 25) {
       const weak = unusual.find((u) => !threats.some((x) => x.coveredKey === u.key));
       swap = weak
         ? { text: `Как вариант: вместо ${weak.name}${weak.time != null ? ` (куплен на ${fmtTime(weak.time)})` : ''} взять ${target.answers[0].name} — ${weak.name} на этом герое почти не собирают, и здесь он не отвечал ни на одну угрозу.` }
