@@ -1,0 +1,11 @@
+{
+  "name": "dota-ruin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Локальный анализатор матчей Dota 2: кто заруинил катку и почему",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/analyze.mjs"
+  }
+}
