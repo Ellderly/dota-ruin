@@ -5,8 +5,13 @@
 
 const OD = 'https://api.opendota.com/api';
 const UNPARSED_TTL = 2 * 60 * 1000;
-const CONST_TTL = 7 * 24 * 3600 * 1000;
+const CONST_TTL = 24 * 3600 * 1000;        // справочники: раз в сутки
+const HERO_TTL = 3 * 24 * 3600 * 1000;      // статистика предметов героя
 const PRO_TTL = 24 * 3600 * 1000;
+// Справочники предметов и способностей берём прямо из репозитория OpenDota (dotaconstants): он обновляется сразу после патчей,
+// а API OpenDota отдаёт его более старую сборку (например, другие цены Hurricane Pike, Heart, Dagon). API — запасной вариант.
+const DC = 'https://raw.githubusercontent.com/odota/dotaconstants/master/build';
+const PRO_WINDOW_DAYS = 60;                  // про-сборки считаем по последним двум месяцам, а не по всему патчу
 const BOOT_KEYS = ['power_treads', 'phase_boots', 'arcane_boots', 'tranquil_boots'];
 
 const isParsed = (m) => m && m.version != null && Array.isArray(m.players) && m.players.some((p) => p.gold_t);
@@ -83,11 +88,30 @@ export function createBackend({ store, apiKey = '', mode = 'server', onWait = nu
     return { status: 200, body };
   }
 
+  async function constantsFile(name) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(`${DC}/${name}.json`, { signal: AbortSignal.timeout(60000) });
+        if (res.ok) return { status: 200, body: await res.json(), repo: true };
+      } catch { /* пробуем ещё раз, потом API */ }
+    }
+    return { ...(await od(`/constants/${name}`)), repo: false };
+  }
+
+  // Дата последнего обновления справочников в репозитории — чтобы честно показывать, насколько данные свежие.
+  async function constantsDate() {
+    try {
+      const res = await fetch('https://api.github.com/repos/odota/dotaconstants/commits?per_page=1&path=build', { signal: AbortSignal.timeout(15000) });
+      if (res.ok) return (await res.json())[0]?.commit?.committer?.date || null;
+    } catch { /* не критично */ }
+    return null;
+  }
+
   async function getConstants() {
-    const cached = await store.get('constants_v6');
+    const cached = await store.get('constants_v7');
     if (cached && Date.now() - cached.at < CONST_TTL) return cached.data;
-    const [h, i, ab, ha, ag, pt] = await Promise.all([od('/constants/heroes'), od('/constants/items'), od('/constants/abilities'),
-      od('/constants/hero_abilities'), od('/constants/aghs_desc'), od('/constants/patch')]);
+    const [h, i, ab, ha, ag, pt, date] = await Promise.all([constantsFile('heroes'), constantsFile('items'), constantsFile('abilities'),
+      constantsFile('hero_abilities'), constantsFile('aghs_desc'), constantsFile('patch'), constantsDate()]);
     if ([h, i, ab, ha, ag, pt].some((x) => x.status !== 200)) {
       if (cached) return cached.data;
       throw new Error('Не удалось загрузить справочники OpenDota');
@@ -124,10 +148,13 @@ export function createBackend({ store, apiKey = '', mode = 'server', onWait = nu
         shard: x.has_shard ? { skill: x.shard_skill_name, desc: x.shard_desc, isNew: !!x.shard_new_skill } : null,
       };
     }
-    const last = Array.isArray(pt.body) ? pt.body[pt.body.length - 1] : null;
-    const patch = last ? { name: last.name, start: Math.floor(new Date(last.date).getTime() / 1000) } : null;
-    const data = { heroes, items, abilities, heroAbilities, aghs, patch };
-    await store.set('constants_v6', { at: Date.now(), data });
+    const plist = Array.isArray(pt.body) ? pt.body : [];
+    const last = plist[plist.length - 1] || null;
+    const patch = last ? { id: last.id, name: last.name, start: Math.floor(new Date(last.date).getTime() / 1000) } : null;
+    const patches = plist.map((x) => ({ id: x.id, name: x.name }));
+    const source = { repo: [h, i, ab, ha, ag].every((x) => x.repo), date };
+    const data = { heroes, items, abilities, heroAbilities, aghs, patch, patches, source };
+    await store.set('constants_v7', { at: Date.now(), data });
     return data;
   }
 
@@ -135,7 +162,7 @@ export function createBackend({ store, apiKey = '', mode = 'server', onWait = nu
   // scenarios/itemTimings — большая выборка, но только покупки до 30:00; itemPopularity — маленькая, зато с лейтом.
   async function getHeroItems(id) {
     const cached = await store.get(`hero_items_${id}`);
-    if (cached && Date.now() - cached.at < CONST_TTL) return cached.data;
+    if (cached && Date.now() - cached.at < HERO_TTL) return cached.data;
     const [sc, pop, consts] = await Promise.all([od(`/scenarios/itemTimings?hero_id=${id}`), od(`/heroes/${id}/itemPopularity`), getConstants()]);
     if (sc.status !== 200 || !Array.isArray(sc.body)) return cached?.data || null;
     const items = {};
@@ -174,17 +201,18 @@ export function createBackend({ store, apiKey = '', mode = 'server', onWait = nu
     const consts = await getConstants();
     if (!consts.patch) return null;
     const vs = enemies.slice(0, 5);
-    const key = `pro_${consts.patch.name}_${hero}_${role}_${[...vs].sort((a, b) => a - b).join('-')}`;
+    const key = `pro_${consts.patch.name}_w${PRO_WINDOW_DAYS}_${hero}_${role}_${[...vs].sort((a, b) => a - b).join('-')}`;
     const cached = await store.get(key);
     if (cached && Date.now() - cached.at < PRO_TTL) return cached.data;
     const flagCols = vs.map((e, i) => `EXISTS (SELECT 1 FROM player_matches e WHERE e.match_id = b.match_id AND e.hero_id = ${e} AND (e.player_slot < 128) <> b.rad) AS v${i}`).join(', ');
     const vcols = vs.map((_, i) => `v${i}`).join(', ');
     const cnt = vs.map((_, i) => `count(*) FILTER (WHERE v${i}) AS c${i}`).join(', ');
-    const sql = `
+    const query = async (since) => {
+      const sql = `
 WITH base AS (
   SELECT pm.match_id, (pm.player_slot < 128) AS rad, pm.purchase_log AS pl, ((pm.player_slot < 128) = m.radiant_win) AS win
   FROM player_matches pm JOIN matches m ON m.match_id = pm.match_id
-  WHERE m.start_time > ${consts.patch.start} AND pm.hero_id = ${hero} AND pm.purchase_log IS NOT NULL AND pm.gold_per_min ${role === 'sup' ? '<' : '>='} 420
+  WHERE m.start_time > ${since} AND pm.hero_id = ${hero} AND pm.purchase_log IS NOT NULL AND pm.gold_per_min ${role === 'sup' ? '<' : '>='} 420
 ), flags AS (SELECT b.match_id, b.pl, b.win${vs.length ? `, ${flagCols}` : ''} FROM base b),
 firsts AS (
   SELECT f.match_id, f.win${vs.length ? `, ${vcols}` : ''}, x->>'key' AS k, min((x->>'time')::int) AS t
@@ -193,16 +221,25 @@ firsts AS (
 SELECT k, count(*) AS c, percentile_cont(0.5) WITHIN GROUP (ORDER BY t) AS med, sum(win::int) AS w${vs.length ? `, ${cnt}` : ''} FROM firsts GROUP BY k
 UNION ALL
 SELECT '__total__', count(*), 0, sum(win::int)${vs.length ? `, ${cnt}` : ''} FROM flags`;
-    const r = await od(`/explorer?sql=${encodeURIComponent(sql)}`);
-    if (r.status !== 200 || !Array.isArray(r.body?.rows)) return cached?.data || null;
-    const total = r.body.rows.find((x) => x.k === '__total__');
-    if (!total || !Number(total.c)) return null;
+      const r = await od(`/explorer?sql=${encodeURIComponent(sql)}`);
+      if (r.status !== 200 || !Array.isArray(r.body?.rows)) return null;
+      const total = r.body.rows.find((x) => x.k === '__total__');
+      return total ? { rows: r.body.rows, total } : null;
+    };
+    // Окно — последние два месяца (букв-патчи 7.41a–f меняют баланс, мета начала патча уже не та). Если игр мало — расширяем до начала патча.
+    const recent = Math.floor(Date.now() / 1000) - PRO_WINDOW_DAYS * 86400;
+    let since = Math.max(consts.patch.start, recent);
+    let res = await query(since);
+    if ((!res || Number(res.total.c) < 40) && since > consts.patch.start) { since = consts.patch.start; res = await query(since); }
+    if (!res) return cached?.data || null;
+    const { rows, total } = res;
+    if (!Number(total.c)) return null;
     const items = {};
-    for (const x of r.body.rows) {
+    for (const x of rows) {
       if (x.k === '__total__') continue;
       items[x.k] = { c: Number(x.c), med: Math.round(Number(x.med)), w: Number(x.w), vs: vs.map((_, i) => Number(x[`c${i}`])) };
     }
-    const data = { patch: consts.patch.name, role, n: Number(total.c), w: Number(total.w), vs: vs.map((e, i) => ({ hero: e, n: Number(total[`c${i}`]) })), items };
+    const data = { patch: consts.patch.name, role, since, n: Number(total.c), w: Number(total.w), vs: vs.map((e, i) => ({ hero: e, n: Number(total[`c${i}`]) })), items };
     await store.set(key, { at: Date.now(), data });
     return data;
   }

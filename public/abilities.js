@@ -51,12 +51,12 @@ export const INNATE_COVERS = {
   slark: { name: 'Dark Pact', why: 'снимается сильным диспелом', fn: (ab) => ab.disp === 'basic' || ab.disp === 'strong' },
   abaddon: { name: 'Aphotic Shield', why: 'снимается сильным диспелом (щит вешается заранее или союзником)', fn: (ab) => ab.disp === 'basic' || ab.disp === 'strong' },
   tidehunter: { name: 'Kraken Shell', why: 'снимается сильным диспелом', fn: (ab) => ab.disp === 'basic' || ab.disp === 'strong' },
-  phantom_lancer: { name: 'Doppelganger', why: 'направленная (уходит в иллюзии) или молчание/рут, снимаемые диспелом', fn: (ab) => ab.targeted || (ab.disp !== 'none' && ab.disp != null && ACTIONABLE(ab)) },
+  phantom_lancer: { name: 'Doppelganger', why: 'направленная — уходит в иллюзии', fn: (ab) => ab.targeted },
   naga_siren: { name: 'Mirror Image', why: 'направленная (уходит в иллюзии) или молчание/рут, снимаемые диспелом', fn: (ab) => ab.targeted || (ab.disp === 'basic' && ACTIONABLE(ab)) },
 };
 
 // Все контролящие способности и предметы врагов, которые реально использовались в матче.
-export function enemyDisables(enemies, consts, parsed, filter) {
+export function enemyDisables(enemies, consts, parsed, filter, me = null) {
   const out = [];
   for (const e of enemies) {
     const uses = e.raw.ability_uses || {};
@@ -66,14 +66,17 @@ export function enemyDisables(enemies, consts, parsed, filter) {
       if (!types) continue;
       const n = parsed ? uses[k] || 0 : 1;
       if (!n) continue;
-      const ab = { key: k, dname: a.dname, hero: e.hero.dname, types, targeted: isTargeted(a), pierce: a.pierce, disp: a.disp, uses: n, item: false };
+      const targeted = isTargeted(a);
+      // ability_targets из реплея: сколько раз враг нажал способность именно на этого героя (для площадных данных нет)
+      const onMe = parsed && targeted && me ? e.raw.ability_targets?.[k]?.[me.hero.name] ?? 0 : null;
+      const ab = { key: k, dname: a.dname, hero: e.hero.dname, types, targeted, pierce: a.pierce, disp: a.disp, uses: n, onMe, item: false };
       if (filter(ab)) out.push(ab);
     }
     for (const [k, d] of Object.entries(ITEM_DISABLES)) {
       if (!e.owned?.has(k)) continue;
       const n = parsed ? e.raw.item_uses?.[k] || 0 : 1;
       if (!n) continue;
-      const ab = { key: k, dname: d.dname, hero: e.hero.dname, types: d.types, targeted: d.targeted, pierce: d.pierce, disp: d.disp, uses: n, item: true };
+      const ab = { key: k, dname: d.dname, hero: e.hero.dname, types: d.types, targeted: d.targeted, pierce: d.pierce, disp: d.disp, uses: n, onMe: null, item: true };
       if (filter(ab)) out.push(ab);
     }
   }

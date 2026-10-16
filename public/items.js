@@ -6,7 +6,7 @@
 //  2. Статистика OpenDota по герою (heroData): из возможных ответов предлагаются только те, что на этом
 //     герое реально собирают. Если герой такие предметы не собирает — это задача союзников, а не его.
 import { fmtTime } from './analyzer.js';
-import { INNATE } from './hero-mechanics.js';
+import { INNATE, INNATE_ABILITY } from './hero-mechanics.js';
 import { enemyDisables, ANSWER_COVERS, INNATE_COVERS, inflictorName } from './abilities.js';
 import { aghsEffects } from './probuild.js';
 
@@ -196,6 +196,27 @@ export function analyzeItems(a, consts, heroData = {}) {
   const shareOf = (p, key) => stat(p, key)?.share || 0;
   const winrate = (st) => (st && st.g >= 50 ? st.w / st.g : null);
 
+  // Ключ защитной способности героя (Counterspell, Rage…) по названию в справочнике патча — для счётчика нажатий.
+  const abilityKey = (p) => {
+    const nm = INNATE_ABILITY[short(p.hero)];
+    if (!nm) return null;
+    return (consts.heroAbilities?.[p.hero.name] || []).find((k) => consts.abilities?.[k]?.dname?.toLowerCase() === nm.toLowerCase()) || null;
+  };
+  // Предметы, чья защита работает только если их нажать, и угрозы, где это важно (у Mjollnir или Maelstrom нажатие ничего не значит).
+  const NEED_PRESS = ['black_king_bar', 'lotus_orb', 'manta', 'cyclone', 'wind_waker', 'glimmer_cape', 'ghost'];
+  const PRESS_RULES = ['control', 'magic', 'silence', 'single'];
+  // Насколько ответ реально сработал: куплен ли вовремя и нажимался ли.
+  function quality(p, k, ruleId) {
+    const t = p.owned.get(k), uses = p.raw.item_uses?.[k] || 0;
+    if (parsed && NEED_PRESS.includes(k) && PRESS_RULES.includes(ruleId) && uses === 0 && t != null && t < dur - 300) return { kind: 'unused', credit: 0, key: k, t };
+    if (CONSUMABLES.includes(k)) return { kind: 'ok', credit: 1, key: k, t }; // расходники покупают ровно тогда, когда нужны
+    if (t != null && t > 0.85 * dur) return { kind: 'late', credit: 0.25, key: k, t };
+    if (t != null && t > 0.65 * dur) return { kind: 'late', credit: 0.5, key: k, t };
+    return { kind: 'ok', credit: 1, key: k, t };
+  }
+  // Ответы «по роли», без статистики героя — для случаев, когда оффлейнер обязан думать о командной угрозе.
+  const roleFits = (rule) => rule.answers.core.filter((k) => items[k]).map((k) => ({ key: k, name: name(k), share: null, tier: 'common', label: 'по роли' }));
+
   // Какие ответы на угрозу подходят конкретному герою (а не роли вообще).
   function suitable(p, rule) {
     const union = [...new Set([...rule.answers.core, ...(rule.answers.sup || [])])].filter((k) => items[k]);
@@ -236,7 +257,7 @@ export function analyzeItems(a, consts, heroData = {}) {
       const srcSet = [...new Set([...srcHeroes, ...srcItems.map((s) => s.e)])];
       const killsOnMe = srcSet.reduce((s, e) => s + (r.killed_by?.[e.hero.name] || 0), 0);
       const dmg = srcSet.reduce((s, e) => s + (dmgTaken[e.hero.name] || 0), 0);
-      const fits = suitable(p, rule);
+      let fits = suitable(p, rule);
       const mine = union.filter((k) => has(p, k));
       const mate = mates.find((m) => union.some((k) => has(m, k))) || null;
       const selfAoe = rule.selfAoe && SELF_AOE.includes(short(p.hero));
@@ -249,7 +270,7 @@ export function analyzeItems(a, consts, heroData = {}) {
       // ---- разбор по способностям: что именно применяли враги и что из этого закрыто ----
       let kitInfo = null;
       if (withKits && KIT_FILTERS[rule.id]) {
-        const kit = enemyDisables(enemies, consts, parsed, KIT_FILTERS[rule.id]);
+        const kit = enemyDisables(enemies, consts, parsed, KIT_FILTERS[rule.id], p);
         if (parsed && !kit.length) continue; // враги этот контроль в матче не применяли
         const prot = [];
         const prof = INNATE_COVERS[short(p.hero)];
@@ -265,7 +286,18 @@ export function analyzeItems(a, consts, heroData = {}) {
           .map((x) => ({ ...x, gain: unc.filter((ab) => ANSWER_COVERS[x.key].fn(ab)).reduce((s, ab) => s + ab.uses, 0) }))
           .filter((x) => x.gain > 0)
           .sort((x, y) => y.gain - x.gain || (y.share ?? 0) - (x.share ?? 0));
-        kitInfo = { kit, unc, prot, total, uncUses, best: cands[0] || null };
+        // Для каждой вражеской способности берём лучшую из подходящих защит (механика героя — всегда «в строю»,
+        // предмет — с учётом того, поздно ли куплен и нажимался ли). Итог — доля закрытого, взвешенная числом применений.
+        for (const x of prot) if (x.key) x.q = quality(p, x.key, rule.id);
+        for (const ab of kit) {
+          const opts = prot.filter((x) => x.fn(ab));
+          ab.credit = opts.length ? Math.max(...opts.map((x) => (x.key ? x.q.credit : 1))) : 0;
+          ab.limit = opts.length && ab.credit < 1 ? opts.filter((x) => x.key).sort((x, y) => y.q.credit - x.q.credit)[0] || null : null;
+        }
+        const covered = kit.filter((ab) => ab.by.length), covUses = covered.reduce((s, ab) => s + ab.uses, 0);
+        const kitCredit = covUses ? covered.reduce((s, ab) => s + ab.uses * ab.credit, 0) / covUses : 0;
+        const weakest = covered.filter((ab) => ab.limit).sort((x, y) => x.credit - y.credit)[0] || null;
+        kitInfo = { kit, unc, prot, total, uncUses, best: cands[0] || null, kitCredit, limit: kitCredit < 0.75 ? weakest : null };
       }
 
       let status = 'open';
@@ -280,6 +312,9 @@ export function analyzeItems(a, consts, heroData = {}) {
         ? [p, ...mates].flatMap((m) => suitable(m, rule).slice(0, 1).map((y) => ({ ...y, m }))).sort((x, y) => (y.share ?? 0.05) - (x.share ?? 0.05))
         : [];
       if (status === 'open' && rule.team && teamCands[0].m !== p) status = 'team_open';
+      // Оффлейнер (позиция 3) отвечает за командные угрозы — антихил, пассивки, невидимость — наравне с саппортами, если их не закрыл никто.
+      let shared = false;
+      if (status === 'team_open' && p.pos === 3 && !tooEarly) { status = 'open'; shared = true; fits = roleFits(rule); }
       if (kitInfo) {
         const { unc, prot, best } = kitInfo;
         if (!unc.length) status = prot.some((x) => x.key) ? 'covered' : 'hero';
@@ -298,43 +333,75 @@ export function analyzeItems(a, consts, heroData = {}) {
       if (status === 'skip') continue; // личная угроза, на которую герой в принципе не собирает ответ
       if (status === 'team_open' && tooEarly) continue;
 
+      // Закрыто — не значит «куплено когда-нибудь»: учитываем, поздно ли куплено и нажимался ли предмет.
+      let credit = ['covered', 'hero', 'mate'].includes(status) ? 1 : 0;
+      let qual = null;
+      if (status === 'covered' && kitInfo) {
+        if (kitInfo.limit) {
+          qual = kitInfo.limit.limit.q;
+          qual.abs = kitInfo.kit.filter((ab) => ab.limit === kitInfo.limit.limit).map((ab) => ab.dname);
+          status = qual.kind === 'unused' ? 'unused' : 'late';
+          credit = kitInfo.kitCredit;
+        }
+      } else if (status === 'covered') {
+        const coverKey = mine[0] || (ownAghs && has(p, ownAghs.key) ? ownAghs.key : null);
+        if (coverKey) {
+          qual = quality(p, coverKey, rule.id);
+          // Если у героя есть своя механика против этой угрозы (Counterspell, Rage…), поздний или ненажатый предмет её не отменяет.
+          if (qual.kind !== 'ok' && innate) { qual = null; status = 'hero'; }
+          else if (qual.kind === 'unused') { status = 'unused'; credit = 0; }
+          else if (qual.kind === 'late') { status = 'late'; credit = qual.credit; }
+        }
+      }
+      // Сколько раз игрок нажал свою защитную способность (Counterspell, Rage, Dark Pact…); пассивные не считаем.
+      const pk = abilityKey(p);
+      const pressInfo = pk && parsed && !consts.abilities[pk].beh.includes('Passive') ? { name: consts.abilities[pk].dname, n: r.ability_uses?.[pk] || 0 } : null;
+      const timesRu = (n) => `${n} ${plural(n, ['раз', 'раза', 'раз'])}`;
+
       const sources = [
         ...srcHeroes.map((e) => e.hero.dname),
         ...srcItems.map((s) => `${name(s.key)} у ${s.e.hero.dname}`),
       ];
       const best = kitInfo ? kitInfo.best : fits[0] || aghsChip;
       const tierK = best ? (kitInfo ? Math.max(0.25, kitInfo.uncUses / kitInfo.total) : 1) : kitInfo && !kitInfo.unc.length ? 1 : 0;
-      const weight = rule.w * tierK * (1 + (p.deaths ? 0.5 * Math.min(1, killsOnMe / p.deaths) : 0)) * Math.min(1.5, count / rule.min);
+      const weight = rule.w * tierK * (shared ? 0.5 : 1) * (1 + (p.deaths ? 0.5 * Math.min(1, killsOnMe / p.deaths) : 0)) * Math.min(1.5, count / rule.min);
       let text, chips = [], abilities = null;
       if (kitInfo) {
         const { kit, unc, best: b } = kitInfo;
-        const abText = (ab) => `${ab.dname} (${ab.hero}, нажал ${usesText(ab.uses).slice(1)} раз за игру${ab.targeted ? '' : ', по площади'}${ab.pierce ? ', сквозь BKB' : ''})`;
-        abilities = kit.map((ab) => ({ name: ab.dname, hero: ab.hero, uses: ab.uses, types: ab.types.map((t) => TYPE_RU[t]), targeted: ab.targeted, pierce: ab.pierce, by: ab.by, item: ab.item }));
+        const abText = (ab) => `${ab.dname} (${ab.hero}, нажал ${usesText(ab.uses).slice(1)} раз за игру${ab.onMe != null ? `, из них на него ${ab.onMe}` : ''}${ab.targeted ? '' : ', по площади'}${ab.pierce ? ', сквозь BKB' : ''})`;
+        abilities = kit.map((ab) => ({ name: ab.dname, hero: ab.hero, uses: ab.uses, onMe: ab.onMe, types: ab.types.map((t) => TYPE_RU[t]), targeted: ab.targeted, pierce: ab.pierce, by: ab.by, item: ab.item }));
         const byProt = {};
         for (const ab of kit) for (const n of ab.by) (byProt[n] ||= []).push(ab.dname);
-        const coveredText = Object.entries(byProt).map(([n, list]) => `${n} — ${list.join(', ')}`).join('; ');
+        const prof2 = INNATE_COVERS[short(p.hero)];
+        const coveredText = Object.entries(byProt).map(([n, list]) => `${n}${pressInfo && prof2 && n === prof2.name ? ` (нажат ${timesRu(pressInfo.n)})` : ''} — ${list.join(', ')}`).join('; ');
+        const onMeTotal = kit.filter((ab) => ab.onMe != null).reduce((s, ab) => s + ab.onMe, 0);
+        const aimed = prof2?.name === 'Counterspell' && parsed
+          ? ` По данным реплея вражеских заклинаний, наведённых на него, было ${onMeTotal} (отражённые могут не учитываться; сколько отразил Counterspell, реплей не сохраняет).` : '';
         if (!unc.length) {
-          text = `Всё, чем враги контролили (${kit.length}), закрыто: ${coveredText}.`;
+          text = `Всё, чем враги контролили (${kit.length}), закрыто: ${coveredText}.${aimed}`;
         } else if (b) {
           chips = [b];
           const pierceLeft = unc.filter((ab) => !ANSWER_COVERS[b.key].fn(ab));
           text = (coveredText ? `Закрыто: ${coveredText}. ` : '') +
             `Не закрыто: ${unc.map(abText).join('; ')}. ` +
             `Против этого на ${p.itemStats ? p.hero.dname : `позиции ${p.pos}`} берут ${answerText(b)} — закрыл бы ${Math.round((b.gain / kitInfo.uncUses) * 100)}% оставшегося контроля.` +
-            (pierceLeft.length ? ` ${pierceLeft.map((x) => x.dname).join(', ')} ${b.key === 'black_king_bar' ? 'проходит сквозь BKB' : 'этим не закрыть'} — тут спасает только позиция.` : '');
+            (pierceLeft.length ? ` ${pierceLeft.map((x) => x.dname).join(', ')} ${b.key === 'black_king_bar' ? 'проходит сквозь BKB' : 'этим не закрыть'} — тут спасает только позиция.` : '') + aimed;
           if (status === 'early') text += ` Но игра закончилась на ${Math.round(durMin)}-й минуте — собрать было нереально.`;
         } else {
           text = (coveredText ? `Закрыто: ${coveredText}. ` : '') +
             `Остальное (${unc.map(abText).join('; ')}) предметами этого героя не закрывается — только позиция и союзники.`;
         }
-      } else if (status === 'covered' && !mine.length && ownAghs) {
+      } else if (['covered', 'late', 'unused'].includes(status) && !mine.length && ownAghs) {
         const t = p.owned.get(ownAghs.key);
         text = `Закрыто своим предметом: ${aghsText}${t != null ? `. Куплен на ${fmtTime(t)}` : ''}.`;
-      } else if (status === 'covered') {
+      } else if (['covered', 'late', 'unused'].includes(status)) {
         const k = mine[0], t = p.owned.get(k), uses = r.item_uses?.[k];
+        // число нажатий осмысленно только у предметов, которые надо нажимать, и только против контроля/магии; у Mjollnir, Maelstrom, Battle Fury эффект пассивный
         text = `Закрыто: ${name(k)}${t != null ? ` на ${fmtTime(t)}` : ''}` +
-          (parsed && ACTIVES.includes(k) ? ` (использовал ${uses || 0} ${plural(uses || 0, ['раз', 'раза', 'раз'])})` : '');
-      } else if (status === 'hero') text = innate ? `Предмет не нужен, герой отвечает сам: ${innate}.` : `Закрыто самим героем: у ${p.hero.dname} есть свой урон по площади`;
+          (parsed && NEED_PRESS.includes(k) && PRESS_RULES.includes(rule.id) ? ` (использовал ${timesRu(uses || 0)})` : '');
+      } else if (status === 'hero') text = innate
+        ? `Предмет не нужен, герой отвечает сам: ${innate}.${pressInfo ? ` ${pressInfo.name} нажат ${timesRu(pressInfo.n)} за игру.` : ''}`
+        : `Закрыто самим героем: у ${p.hero.dname} есть свой урон по площади`;
       else if (status === 'mate') text = innateMate
         ? `Закрывает герой союзника — ${innateMate.hero.dname}: ${INNATE[short(innateMate.hero)][rule.id]}.`
         : `Закрыл союзник: ${name(union.find((k) => has(mate, k)))} у ${mate.hero.dname}`;
@@ -344,24 +411,34 @@ export function analyzeItems(a, consts, heroData = {}) {
         chips = union.map((k) => ({ key: k, name: name(k), label: 'закрывает эту угрозу' }));
         const cands = teamCands.filter((c) => c.m !== p && c.tier !== 'rare');
         const who = cands.slice(0, 2).map((c) => `${c.name} на ${c.m.hero.dname}${c.share != null ? ` (берут в ${pctText(c.share)} игр)` : ''}`);
-        const base = `Закрывается предметами: ${union.map(name).join(', ')}. ` +
-          (fits.length ? `${p.hero.dname} — не первый кандидат на них в этой команде.` : `На ${p.hero.dname} их не собирают — это задача союзников.`);
-        if (status === 'team_ok') text = `${base} Закрыл ${mate.hero.dname}: ${name(union.find((k) => has(mate, k)))}.` + (ownAghs ? ` Свой ответ у героя тоже был: ${aghsText}.` : '');
-        else text = `${base} В команде не купил никто.` + (who.length ? ` Логичнее всего: ${who.join(' или ')}.` : ' Стандартно эти предметы не собирает ни один герой команды — закрыть угрозу можно было только нестандартной покупкой.');
+        const maxShare = Math.max(0, ...union.map((k) => shareOf(p, k)));
+        const rarely = p.itemStats ? `${p.hero.dname} такие предметы берёт редко${maxShare > 0 ? ` (в ${pctText(maxShare)} игр)` : ''}` : `${p.hero.dname} — не первый кандидат на них`;
+        const base = `Закрывается предметами: ${union.map(name).join(', ')}. `;
+        if (status === 'team_ok') text = `${base}Закрыл ${mate.hero.dname}: ${name(union.find((k) => has(mate, k)))}. ${rarely}, поэтому с него это не спрашивается.` + (ownAghs ? ` Свой ответ у героя тоже был: ${aghsText}.` : '');
+        else text = `${base}В команде не купил никто. ${rarely}.` + (who.length ? ` Логичнее всего: ${who.join(' или ')}.` : ' Стандартно эти предметы не собирает ни один герой команды — закрыть угрозу можно было только нестандартной покупкой.');
       } else if (!fits.length && ownAghs) {
         chips = [aghsChip];
         text = `Не закрыто. Свой ответ у героя: ${aghsText}.` + (status === 'early' ? ` Но игра закончилась на ${Math.round(durMin)}-й минуте.` : '');
+      } else if (shared) {
+        const who = teamCands.filter((c) => c.m !== p).slice(0, 1).map((c) => `${c.name} на ${c.m.hero.dname}`);
+        chips = fits.slice(0, 4);
+        text = `Не закрыл никто в команде. Для оффлейнера это обычная покупка: ${fits.slice(0, 3).map((x) => x.name).join(' / ')}.${who.length ? ` Ещё подходило: ${who[0]}.` : ''}`;
       } else {
         chips = [...(ownAghs ? [aghsChip] : []), ...fits.slice(0, 4)];
-        text = `Не закрыто. ${p.itemStats ? `На ${p.hero.dname}` : `На позиции ${p.pos}`} для этого берут: ${fits.slice(0, 2).map(answerText).join('; ')}.` +
-''; 
+        text = `Не закрыто. ${p.itemStats ? `На ${p.hero.dname}` : `На позиции ${p.pos}`} для этого берут: ${fits.slice(0, 2).map(answerText).join('; ')}.`;
+      }
+      if (qual?.kind === 'unused') {
+        text = `Куплен ${name(qual.key)} на ${fmtTime(qual.t)}, но за игру ни разу не нажат${qual.abs?.length ? ` — а он был единственной защитой от: ${qual.abs.join(', ')}` : ''}.`;
+      } else if (qual?.kind === 'late') {
+        text = `${text.replace(/\.?$/, '.')} Но куплено поздно: ${name(qual.key)} на ${fmtTime(qual.t)}, а игра шла ${fmtTime(dur)}${qual.abs?.length ? ` — до этого от ${qual.abs.join(', ')} защиты не было` : ' — большую часть игры этой защиты не было'}.`;
       }
 
       threats.push({
         id: rule.id, title: rule.title, why: rule.why, status, weight, sources, text, chips,
         answers: best ? [best, ...fits.filter((x) => x.key !== best.key)] : fits,
-        covered: status === 'covered' || status === 'hero' || status === 'mate',
-        counted: ['covered', 'hero', 'mate', 'open'].includes(status),
+        covered: ['covered', 'late', 'hero', 'mate'].includes(status),
+        counted: ['covered', 'late', 'unused', 'hero', 'mate', 'open'].includes(status),
+        credit, shared,
         killsOnMe, dmg, dmgShare: heroDmgTotal ? dmg / heroDmgTotal : null,
         coveredKey: kitInfo ? kitInfo.prot.find((x) => x.key)?.key || null : mine[0] || (ownAghs && has(p, ownAghs.key) ? ownAghs.key : null),
         abilities,
@@ -380,7 +457,7 @@ export function analyzeItems(a, consts, heroData = {}) {
       magic.text += ` Больше всего магического урона по нему: ${magicTop.map((x) => `${x.name}${x.hero ? ` (${x.hero})` : ''} — ${x.dmg.toLocaleString('ru-RU')}${x.pierce ? ', сквозь BKB' : ''}`).join('; ')}.`;
     }
 
-    const ORDER = { open: 0, team_open: 1, early: 2, team_ok: 3, mate: 4, hero: 4, covered: 4 };
+    const ORDER = { open: 0, unused: 0, team_open: 1, early: 2, late: 3, team_ok: 3, mate: 4, hero: 4, covered: 4 };
     threats.sort((x, y) => (ORDER[x.status] - ORDER[y.status]) || y.weight - x.weight);
 
     // тайминги относительно того, как этот предмет берут на этом герое
@@ -454,10 +531,10 @@ export function analyzeItems(a, consts, heroData = {}) {
       }
     }
 
-    const open = threats.filter((x) => x.status === 'open');
+    const open = threats.filter((x) => x.status === 'open' || x.status === 'unused');
     let swap = null;
     const strongOpen = open;
-    const target = strongOpen.find((x) => x.answers[0]);
+    const target = strongOpen.find((x) => x.status === 'open' && x.answers[0]);
     if (target && effMin > 25) {
       const weak = unusual.find((u) => !threats.some((x) => x.coveredKey === u.key));
       swap = weak
@@ -474,7 +551,7 @@ export function analyzeItems(a, consts, heroData = {}) {
 
     const counted = threats.filter((x) => x.counted && x.weight > 0);
     const total = counted.reduce((s, x) => s + x.weight, 0);
-    const score = total ? Math.round((100 * counted.filter((x) => x.covered).reduce((s, x) => s + x.weight, 0)) / total) : null;
+    const score = total ? Math.round((100 * counted.reduce((s, x) => s + x.weight * (x.credit ?? (x.covered ? 1 : 0)), 0)) / total) : null;
     const label = score == null ? 'Особых требований к сборке не было' : score >= 75 ? 'Сборка под врагов' : score >= 45 ? 'Сборка частично под врагов' : 'Сборка мимо врагов';
     const openTitles = strongOpen.map((x) => x.title.toLowerCase());
     let summary;

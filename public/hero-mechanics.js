@@ -7,7 +7,7 @@
 // Герои без записи разобраны и пропущены: у них нет способности, которая заменяет предмет.
 // Таблица составлена вручную по устоявшимся механикам; после патчей её стоит перепроверять.
 
-const DOPPEL = 'Doppelganger сбрасывает дебаффы и прячет настоящего героя среди иллюзий. BKB на нём не берут: он выдаёт, какой из лансеров настоящий';
+const DOPPEL = 'Doppelganger уводит героя с карты и прячет настоящего среди иллюзий. BKB на нём почти не берут (в статистике это ~2% игр)';
 const MIRROR = 'Mirror Image сбрасывает дебаффы и даёт неуязвимость на время каста, Song of the Siren останавливает драку. BKB выдаёт настоящую нагу среди иллюзий';
 const RAGE = 'Rage даёт иммунитет к магии и дебаффам — это встроенный BKB';
 const PACT = 'Dark Pact — сильный диспел с коротким кулдауном, нажимается заранее';
@@ -18,6 +18,16 @@ const DISSIMILATE = 'Dissimilate убирает героя с карты на в
 const GRAVE = 'Shallow Grave не даёт умереть под фокусом';
 const PROMISE = 'False Promise откладывает весь входящий урон и снимает дебаффы';
 const HEX = 'Hex — мгновенный контроль, от которого не уйти блинком';
+
+// Названия защитных способностей, чтобы показывать, сколько раз игрок их реально нажал (ability_uses из реплея).
+// Ключ способности ищется в справочнике патча по названию; пассивные (Medusa, Tidehunter…) в счётчик не попадают.
+export const INNATE_ABILITY = {
+  phantom_lancer: 'Doppelganger', naga_siren: 'Mirror Image', life_stealer: 'Rage', juggernaut: 'Blade Fury', slark: 'Dark Pact',
+  antimage: 'Counterspell', ursa: 'Enrage', faceless_void: 'Time Walk', weaver: 'Time Lapse', ember_spirit: 'Flame Guard',
+  templar_assassin: 'Refraction', puck: 'Phase Shift', void_spirit: 'Dissimilate', abaddon: 'Aphotic Shield', necrolyte: 'Ghost Shroud',
+  dazzle: 'Shallow Grave', oracle: 'False Promise', omniknight: 'Guardian Angel', winter_wyvern: 'Cold Embrace', pugna: 'Decrepify',
+  lich: 'Frost Shield', treant: 'Living Armor', dark_willow: 'Shadow Realm', windrunner: 'Windrun', legion_commander: 'Press the Attack',
+};
 
 export const INNATE = {
   // коры
@@ -35,7 +45,6 @@ export const INNATE = {
   templar_assassin: { magic: 'Refraction полностью блокирует несколько получений урона' },
   puck: { magic: PHASE, single: PHASE },
   void_spirit: { magic: DISSIMILATE, single: DISSIMILATE },
-  tinker: { magic: 'Defense Matrix даёт барьер и сопротивление эффектам' },
   storm_spirit: { mobile: 'Electric Vortex — мгновенный контроль' },
   // оффлейнеры
   abaddon: { control: APHOTIC, magic: APHOTIC },

@@ -187,7 +187,11 @@ export function analyzeMatch(m, consts) {
     list.sort((a, b) => a.time - b.time);
     for (const d of list) {
       const minute = Math.max(0, Math.floor(d.time / 60));
-      if (d.goldFed == null) d.goldFed = Math.round(150 * econ + (at(p.nwT, minute) || 0) * 0.03);
+      // У ~1% смертей от героев OpenDota отдаёт gold_fed = 0 (дыра в данных, не «золото не отдано») — подставляем оценку и помечаем «≈».
+      if (d.goldFed == null || (d.goldFed === 0 && String(d.killer).includes('_hero_'))) {
+        d.goldFed = Math.round(150 * econ + (at(p.nwT, minute) || 0) * 0.03);
+        d.estimated = true;
+      }
       if (d.timeDead == null) d.timeDead = Math.round(clamp(6 + minute * 1.6, 6, 100));
       d.fight = null;
     }
@@ -814,7 +818,7 @@ export function analyzeMatch(m, consts) {
     meta: {
       id: m.match_id, duration: dur, startTime: m.start_time, radiantWin: !!m.radiant_win,
       radiantScore: m.radiant_score ?? totals.radiant.kills, direScore: m.dire_score ?? totals.dire.kills,
-      gameMode: m.game_mode, turbo, parsed, loser, winner,
+      gameMode: m.game_mode, patchId: m.patch ?? null, turbo, parsed, loser, winner,
       radiantName: m.radiant_team?.name || m.radiant_name || 'Radiant', direName: m.dire_team?.name || m.dire_name || 'Dire',
       avgRank: Math.round(sum(players, (p) => p.raw.rank_tier || 0) / (players.filter((p) => p.raw.rank_tier).length || 1)) || null,
     },

@@ -3,13 +3,16 @@
 import { fmtTime } from './analyzer.js';
 
 // Что даёт Аганим или Шард — по тексту описания из текущего патча. Ключи совпадают с id угроз в items.js.
+// Проверка идёт по предложениям: слово «break» в «Mana Break» или «break the coil» — не «Break» (отключение пассивок),
+// а «Health Restoration» в «amplifies health restoration» — усиление лечения, а не антихил.
 const AGHS_TAGS = [
-  ['heal', /health restoration|reduc\w* (their )?heal|heal\w* reduction|cannot heal|prevent\w* heal/i, 'режет восстановление здоровья — это антихил'],
-  ['break', /\bbreak\b|disables? (their )?passive/i, 'отключает пассивки'],
-  ['invis', /true sight|reveal/i, 'показывает невидимых'],
-  ['evasion', /true strike|cannot miss|can't miss/i, 'атаки не промахиваются'],
-  ['control', /debuff immunity|spell immunity|magic immunity|strong dispel/i, 'даёт иммунитет или сильный диспел'],
+  ['heal', (t) => /\b(reduc\w*|decreas\w*|prevent\w*|disabl\w*|block\w*|cuts?)\b[^.]{0,60}\b(health restoration|heal amplification|healing|health regen\w*)/i.test(t)
+    && !/\b(amplif\w*|increas\w*)\b[^.]{0,20}health restoration/i.test(t),
+    'режет восстановление здоровья — это антихил'],
+  ['break', (t) => /\b(appl(y|ies|ying)|causes?|inflicts?)\s+Break\b|\bBreak\s+(enemies|the target|targets|them)\b/.test(t), 'отключает пассивки (Break)'],
 ];
+// Только однозначные случаи. Иммунитет «на время канала», «только иллюзии» или «истинное зрение в луче» ответом на угрозу не считаем.
+
 
 export function aghsEffects(consts, heroId) {
   const a = consts.aghs?.[heroId];
@@ -17,7 +20,12 @@ export function aghsEffects(consts, heroId) {
   for (const [kind, key] of [['scepter', 'ultimate_scepter'], ['shard', 'aghanims_shard']]) {
     const d = a?.[kind];
     if (!d?.desc) continue;
-    for (const [id, re, ru] of AGHS_TAGS) if (re.test(d.desc)) out.push({ id, key, kind, skill: d.skill, desc: d.desc, ru });
+    const sentences = d.desc.split(/(?<=[.!?])\s+|\n+/);
+    for (const [id, test, ru] of AGHS_TAGS) {
+      // «mana» в предложении без «health» — это про ману, а не про здоровье
+      const hit = sentences.find((sn) => test(sn) && !(id === 'heal' && /\bmana\b/i.test(sn) && !/\bhealth|heal\b/i.test(sn)));
+      if (hit) out.push({ id, key, kind, skill: d.skill, desc: d.desc, ru });
+    }
   }
   return out;
 }
@@ -86,16 +94,15 @@ export function analyzePro(a, consts, proData = {}) {
       lines.push({ kind: 'timing', text: `Отставание от про-таймингов: ${late.slice(0, 3).map((c) => `${c.name} на ${fmtTime(c.time)} вместо ≈${fmtTime(c.med)} (+${fmtTime(c.time - c.med)})`).join('; ')}.` });
     }
 
-    // 4. Порядок покупок: что про собирают раньше.
+    // 4. Порядок: что игрок собрал раньше предмета, который про берут первым, — и сколько золота на это ушло.
     const mine = [...p.owned.entries()].filter(([k, t]) => t != null && big(k)).sort((x, y) => x[1] - y[1]);
-    for (const [k, t] of mine) {
-      const myMed = d.items[k]?.med;
-      if (myMed == null) continue;
-      // только если «правильный» предмет тоже собран, но позже; не собранное уходит в пункт про недостающее
-      const earlier = p.pro.core.find((c) => c.share >= 0.5 && c.med + 360 <= myMed && p.owned.get(c.key) > t && t > c.med);
-      if (earlier) {
-        lines.push({ kind: 'order', text: `Порядок: ${name(k)} собран на ${fmtTime(t)} раньше, чем ${earlier.name}. Про обычно сначала берут ${earlier.name} (≈${fmtTime(earlier.med)}), а ${name(k)} — ближе к ${fmtTime(myMed)}.` });
-        break;
+    const delayed = p.pro.core.find((c) => c.share >= 0.5 && c.has && c.time != null && c.time - c.med >= 420);
+    if (delayed) {
+      const before = mine.filter(([k, t]) => t < delayed.time && k !== delayed.key && !(items[delayed.key]?.parts || []).includes(k)
+        && !BOOT_UPGRADES.includes(k) && !p.pro.core.some((c) => c.key === k && c.med <= delayed.med + 300));
+      if (before.length) {
+        const gold = before.reduce((sum, [k]) => sum + (items[k]?.cost || 0), 0);
+        lines.push({ kind: 'order', text: `Порядок: ${delayed.name} собран только на ${fmtTime(delayed.time)}, хотя про берут его первым примерно к ${fmtTime(delayed.med)}. До него куплено: ${before.slice(0, 4).map(([k, t]) => `${name(k)} (${fmtTime(t)})`).join(', ')} — это около ${Math.round(gold / 100) * 100} золота, которое могло пойти в ${delayed.name}.` });
       }
     }
 
